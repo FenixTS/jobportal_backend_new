@@ -11,37 +11,143 @@ app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// MongoDB Connection with updated options
-const connectDB = async () => {
+// Cache the database connection
+let cachedDb = null;
+
+// MongoDB Connection with serverless-friendly options
+const connectDB = async (retryCount = 0) => {
   try {
-    await mongoose.connect(process.env.MONGO_URI, {
+    // If we have a cached connection, return it
+    if (cachedDb) {
+      console.log('Using cached database connection');
+      return cachedDb;
+    }
+
+    if (!process.env.MONGO_URI) {
+      console.error('MONGO_URI is not defined in environment variables');
+      return;
+    }
+
+    console.log(`Attempting to connect to MongoDB... (Attempt ${retryCount + 1})`);
+    
+    const options = {
       useNewUrlParser: true,
       useUnifiedTopology: true,
-      serverSelectionTimeoutMS: 30000, // Increased timeout
-      socketTimeoutMS: 45000,
-      connectTimeoutMS: 30000,
-      maxPoolSize: 10,
-      minPoolSize: 5,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 10000,
+      connectTimeoutMS: 10000,
+      family: 4,
+      maxPoolSize: 1,
+      minPoolSize: 0,
+      maxIdleTimeMS: 10000,
       retryWrites: true,
-      w: 'majority'
+      w: 'majority',
+      ssl: true
+    };
+
+    // Parse the connection string to check format
+    const uri = process.env.MONGO_URI;
+    if (!uri.includes('mongodb+srv://')) {
+      throw new Error('Invalid MongoDB URI format. Must use mongodb+srv:// for Atlas');
+    }
+
+    // Try to connect with a timeout
+    const connectPromise = mongoose.connect(uri, options);
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Connection timeout')), 10000);
     });
+
+    await Promise.race([connectPromise, timeoutPromise]);
     console.log('MongoDB Connected Successfully');
+
+    // Cache the connection
+    cachedDb = mongoose.connection;
+
+    mongoose.connection.on('connected', () => {
+      console.log('MongoDB Connected Successfully');
+    });
+
+    mongoose.connection.on('error', (err) => {
+      console.error('MongoDB Connection Error:', err);
+      cachedDb = null; // Clear cache on error
+      if (retryCount < 3) {
+        console.log(`Retrying connection... (${retryCount + 1}/3)`);
+        setTimeout(() => connectDB(retryCount + 1), 2000);
+      }
+    });
+
+    mongoose.connection.on('disconnected', () => {
+      console.log('MongoDB Disconnected');
+      cachedDb = null; // Clear cache on disconnect
+      if (retryCount < 3) {
+        console.log(`Retrying connection... (${retryCount + 1}/3)`);
+        setTimeout(() => connectDB(retryCount + 1), 2000);
+      }
+    });
+
+    return cachedDb;
+
   } catch (err) {
     console.error('MongoDB Connection Error:', err);
-    // Don't exit process in production
-    if (process.env.NODE_ENV !== 'production') {
-      process.exit(1);
+    cachedDb = null; // Clear cache on error
+    if (retryCount < 3) {
+      console.log(`Retrying connection... (${retryCount + 1}/3)`);
+      setTimeout(() => connectDB(retryCount + 1), 2000);
     }
+    throw err;
   }
 };
 
 // Connect to MongoDB
-connectDB();
+connectDB().catch(console.error);
+
+// Middleware to check database connection
+const checkDBConnection = async (req, res, next) => {
+  try {
+    if (!cachedDb || cachedDb.readyState !== 1) {
+      await connectDB();
+    }
+    next();
+  } catch (err) {
+    res.status(503).json({
+      message: 'Database connection not ready',
+      state: cachedDb ? cachedDb.readyState : 0,
+      mongoUri: process.env.MONGO_URI ? 'configured' : 'not configured',
+      connectionState: {
+        0: 'disconnected',
+        1: 'connected',
+        2: 'connecting',
+        3: 'disconnecting'
+      }[cachedDb ? cachedDb.readyState : 0],
+      lastError: err.message || null,
+      connectionString: process.env.MONGO_URI ? 
+        process.env.MONGO_URI.replace(/mongodb(\+srv)?:\/\/[^:]+:[^@]+@/, 'mongodb$1://****:****@') : 
+        'not configured'
+    });
+  }
+};
 
 // Basic route for root
 app.get('/', (req, res) => {
-  res.status(200).json({ message: 'Welcome to Job Portal API' });
+  res.status(200).json({ 
+    message: 'Welcome to Job Portal API',
+    database: cachedDb && cachedDb.readyState === 1 ? 'connected' : 'disconnected',
+    mongoUri: process.env.MONGO_URI ? 'configured' : 'not configured',
+    connectionState: {
+      0: 'disconnected',
+      1: 'connected',
+      2: 'connecting',
+      3: 'disconnecting'
+    }[cachedDb ? cachedDb.readyState : 0],
+    lastError: null,
+    connectionString: process.env.MONGO_URI ? 
+      process.env.MONGO_URI.replace(/mongodb(\+srv)?:\/\/[^:]+:[^@]+@/, 'mongodb$1://****:****@') : 
+      'not configured'
+  });
 });
+
+// Apply database connection check to all API routes
+app.use('/api', checkDBConnection);
 
 // Routes
 app.use('/api/jobs', require('./routes/jobRoutes'));
@@ -50,11 +156,22 @@ app.use('/api/upload', require('./routes/uploadRoutes'));
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  const dbState = mongoose.connection.readyState;
+  const dbState = cachedDb ? cachedDb.readyState : 0;
   res.status(200).json({ 
     status: 'ok',
     database: dbState === 1 ? 'connected' : 'disconnected',
-    dbState: dbState
+    dbState: dbState,
+    mongoUri: process.env.MONGO_URI ? 'configured' : 'not configured',
+    connectionState: {
+      0: 'disconnected',
+      1: 'connected',
+      2: 'connecting',
+      3: 'disconnecting'
+    }[dbState],
+    connectionString: process.env.MONGO_URI ? 
+      process.env.MONGO_URI.replace(/mongodb(\+srv)?:\/\/[^:]+:[^@]+@/, 'mongodb$1://****:****@') : 
+      'not configured',
+    lastError: null
   });
 });
 
@@ -72,7 +189,16 @@ app.use((err, req, res, next) => {
   console.error('Error:', err);
   res.status(err.status || 500).json({ 
     message: err.message || 'Something went wrong!',
-    error: process.env.NODE_ENV === 'development' ? err : {}
+    error: process.env.NODE_ENV === 'development' ? err : {},
+    database: cachedDb && cachedDb.readyState === 1 ? 'connected' : 'disconnected',
+    mongoUri: process.env.MONGO_URI ? 'configured' : 'not configured',
+    connectionState: {
+      0: 'disconnected',
+      1: 'connected',
+      2: 'connecting',
+      3: 'disconnecting'
+    }[cachedDb ? cachedDb.readyState : 0],
+    lastError: err.message || null
   });
 });
 
