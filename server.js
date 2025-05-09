@@ -12,18 +12,35 @@ app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // MongoDB Connection with updated options
-mongoose.connect(process.env.MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-  serverSelectionTimeoutMS: 5000,
-  socketTimeoutMS: 45000,
-})
-.then(() => {
-  console.log('MongoDB Connected Successfully');
-})
-.catch(err => {
-  console.error('MongoDB Connection Error:', err);
-  process.exit(1);
+const connectDB = async () => {
+  try {
+    await mongoose.connect(process.env.MONGO_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      serverSelectionTimeoutMS: 30000, // Increased timeout
+      socketTimeoutMS: 45000,
+      connectTimeoutMS: 30000,
+      maxPoolSize: 10,
+      minPoolSize: 5,
+      retryWrites: true,
+      w: 'majority'
+    });
+    console.log('MongoDB Connected Successfully');
+  } catch (err) {
+    console.error('MongoDB Connection Error:', err);
+    // Don't exit process in production
+    if (process.env.NODE_ENV !== 'production') {
+      process.exit(1);
+    }
+  }
+};
+
+// Connect to MongoDB
+connectDB();
+
+// Basic route for root
+app.get('/', (req, res) => {
+  res.status(200).json({ message: 'Welcome to Job Portal API' });
 });
 
 // Routes
@@ -31,40 +48,41 @@ app.use('/api/jobs', require('./routes/jobRoutes'));
 app.use('/api/drafts', require('./routes/draftRoutes'));
 app.use('/api/upload', require('./routes/uploadRoutes'));
 
-// Function to find an available port
-const findAvailablePort = async (startPort) => {
-  const net = require('net');
-  
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.unref();
-    server.on('error', (err) => {
-      if (err.code === 'EADDRINUSE') {
-        resolve(findAvailablePort(startPort + 1));
-      } else {
-        reject(err);
-      }
-    });
-    
-    server.listen(startPort, () => {
-      server.close(() => {
-        resolve(startPort);
-      });
-    });
+// Health check endpoint
+app.get('/health', (req, res) => {
+  const dbState = mongoose.connection.readyState;
+  res.status(200).json({ 
+    status: 'ok',
+    database: dbState === 1 ? 'connected' : 'disconnected',
+    dbState: dbState
   });
-};
+});
 
-// Start server with dynamic port
-const startServer = async () => {
-  try {
-    const port = await findAvailablePort(process.env.PORT || 5000);
-    app.listen(port, () => {
-      console.log(`Server running on port ${port}`);
-    });
-  } catch (error) {
-    console.error('Failed to start server:', error);
-    process.exit(1);
-  }
-};
+// Handle 404
+app.use((req, res) => {
+  res.status(404).json({ 
+    message: 'Route not found',
+    path: req.path,
+    method: req.method
+  });
+});
 
-startServer(); 
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Error:', err);
+  res.status(err.status || 500).json({ 
+    message: err.message || 'Something went wrong!',
+    error: process.env.NODE_ENV === 'development' ? err : {}
+  });
+});
+
+// For local development
+if (process.env.NODE_ENV !== 'production') {
+  const PORT = process.env.PORT || 5000;
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
+
+// Export for Vercel
+module.exports = app; 
